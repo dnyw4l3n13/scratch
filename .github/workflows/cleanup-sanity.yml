@@ -1,0 +1,33 @@
+name: Cleanup sanity-runs
+
+# Weekly reset of the `sanity-runs` branch used by NanoClaw container
+# startup-check. That branch is force-pushed on every container spawn to prove
+# SSH + GPG signing + push access work end-to-end. No history needs to survive
+# — we just reset the branch to a single clean commit to keep the repo tidy
+# and avoid accidental accumulation of weird state.
+#
+# Deletes the branch outright. Next container spawn recreates it.
+
+on:
+  schedule:
+    # Sunday 04:00 UTC — chosen to not collide with weekday working hours.
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  reset-sanity-runs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete sanity-runs branch if it exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/branches/sanity-runs" >/dev/null 2>&1; then
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/sanity-runs"
+            echo "Deleted sanity-runs branch."
+          else
+            echo "sanity-runs branch does not exist — nothing to do."
+          fi
