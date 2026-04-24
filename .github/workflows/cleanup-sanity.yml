@@ -1,33 +1,66 @@
 name: Cleanup sanity-runs
 
-# Weekly reset of the `sanity-runs` branch used by NanoClaw container
-# startup-check. That branch is force-pushed on every container spawn to prove
-# SSH + GPG signing + push access work end-to-end. No history needs to survive
-# — we just reset the branch to a single clean commit to keep the repo tidy
-# and avoid accidental accumulation of weird state.
+# NanoClaw container startup-check creates one branch per run per protocol:
+#   sanity-runs/ssh/YYYYMMDDHHMMSS
+#   sanity-runs/https/YYYYMMDDHHMMSS
 #
-# Deletes the branch outright. Next container spawn recreates it.
+# Keep anything from the last 7 days (useful for diagnosing a broken container
+# — compare a failing run's commit to a known-good one from earlier in the
+# week). Delete everything older.
 
 on:
   schedule:
-    # Sunday 04:00 UTC — chosen to not collide with weekday working hours.
-    - cron: '0 4 * * 0'
+    # Daily at 04:00 UTC. Frequent enough that the pruning window stays close
+    # to "7 days" rather than drifting into "up to 14 days".
+    - cron: '0 4 * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  reset-sanity-runs:
+  prune:
     runs-on: ubuntu-latest
     steps:
-      - name: Delete sanity-runs branch if it exists
+      - name: Prune sanity-runs/** branches older than 7 days
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh api "repos/${GITHUB_REPOSITORY}/branches/sanity-runs" >/dev/null 2>&1; then
-            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/sanity-runs"
-            echo "Deleted sanity-runs branch."
-          else
-            echo "sanity-runs branch does not exist — nothing to do."
+          set -euo pipefail
+          CUTOFF=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          echo "Pruning sanity-runs/** branches with tip-commit older than $CUTOFF"
+
+          # Paginate through branches; gh paginate handles links automatically.
+          mapfile -t BRANCHES < <(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/branches" \
+              --jq '.[].name' \
+            | grep -E '^sanity-runs/(ssh|https)/[0-9]{14}$' || true
+          )
+
+          if [ "${#BRANCHES[@]}" -eq 0 ]; then
+            echo "No matching branches found."
+            exit 0
           fi
+
+          kept=0
+          deleted=0
+          for branch in "${BRANCHES[@]}"; do
+            # Resolve the tip commit's author date — cheap, one API call.
+            tip_date=$(gh api "repos/${GITHUB_REPOSITORY}/branches/${branch}" \
+              --jq '.commit.commit.author.date' 2>/dev/null || echo "")
+            if [ -z "$tip_date" ]; then
+              echo "skip (unreadable tip): $branch"
+              continue
+            fi
+            if [ "$tip_date" \< "$CUTOFF" ]; then
+              # URL-encode the branch name for the ref path.
+              ref_path=$(printf '%s' "$branch" | sed 's|/|%2F|g')
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${ref_path}"
+              echo "deleted: $branch (tip $tip_date)"
+              deleted=$((deleted + 1))
+            else
+              kept=$((kept + 1))
+            fi
+          done
+
+          echo "Summary: kept=$kept deleted=$deleted"
